@@ -108,7 +108,8 @@ def create_dataloader(path,
                       image_weights=False,
                       quad=False,
                       prefix='',
-                      shuffle=False):
+                      shuffle=False,
+                      fusion=True):
     if rect and shuffle:
         LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
@@ -125,7 +126,8 @@ def create_dataloader(path,
             stride=int(stride),
             pad=pad,
             image_weights=image_weights,
-            prefix=prefix)
+            prefix=prefix,
+            fusion=fusion)
 
     batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
@@ -187,7 +189,6 @@ class LoadImages:
             files = [p]  # files
         else:
             raise Exception(f'ERROR: {p} does not exist')
-
         images = [x for x in files if x.split('.')[-1].lower() in IMG_FORMATS]
         videos = [x for x in files if x.split('.')[-1].lower() in VID_FORMATS]
         ni, nv = len(images), len(videos)
@@ -236,12 +237,15 @@ class LoadImages:
             # Read image
             self.count += 1
             img0 = cv2.imread(path)  # BGR
+            roi_img = img0[180:788, 400:1360, :]
             assert img0 is not None, f'Image Not Found {path}'
             s = f'image {self.count}/{self.nf} {path}: '
-
         # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride, auto=self.auto)[0]
-
+        img = letterbox(img0, (608, 960), stride=self.stride, auto=self.auto)[0]
+        print(img.shape)
+        print(roi_img.shape)
+        print(img.shape)
+        img = np.vstack((img, roi_img))
         # Convert
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
         img = np.ascontiguousarray(img)
@@ -410,7 +414,8 @@ class LoadImagesAndLabels(Dataset):
                  single_cls=False,
                  stride=32,
                  pad=0.0,
-                 prefix=''):
+                 prefix='',
+                 fusion=True):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
@@ -421,7 +426,9 @@ class LoadImagesAndLabels(Dataset):
         self.stride = stride
         self.path = path
         self.albumentations = Albumentations() if augment else None
-
+        self.fusion = fusion
+        if self.fusion:
+            self.mosaic = False
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -531,6 +538,21 @@ class LoadImagesAndLabels(Dataset):
                     gb += self.ims[i].nbytes
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})'
             pbar.close()
+        self.roi_ims = [None] * n
+        self.roi_npy_files = [Path(f[:-4]+'_roi.npy') for f in self.im_files]
+        if cache_images:
+            gb = 0
+            fcn = self.cache_images_to_disk if cache_images == 'disk' else self.load_roi_image
+            results = ThreadPool(NUM_THREADS).imap(fcn, range(n))
+            pbar = tqdm(enumerate(results), total=n, bar_format=BAR_FORMAT, disable=LOCAL_RANK > 0)
+            for i, x in pbar:
+                if cache_images == 'disk':
+                    gb += self.roi_npy_files[i].stat().st_size
+                else:
+                    self.roi_ims[i] = x
+                    gb += self.roi_ims[i].nbytes
+                pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB {cache_images})' 
+            pbar.close()
 
     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
         # Cache dataset labels, check images and read shapes
@@ -592,6 +614,15 @@ class LoadImagesAndLabels(Dataset):
             # MixUp augmentation
             if random.random() < hyp['mixup']:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.randint(0, self.n - 1)))
+        elif self.fusion:
+            img, (h0,w0), (h, w) = self.load_image(index)
+            img, ratio, pad = letterbox(img, (608, 960), auto=False, scaleup=self.augment)
+            labels = self.labels[index].copy()
+            roi_img = self.load_roi_image(index)
+            if labels.size:
+                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0]*w, ratio[1]*h, padw=pad[0], padh=pad[1])
+            shapes = None
+            img = np.vstack((img, roi_img))
 
         else:
             # Load image
@@ -601,7 +632,6 @@ class LoadImagesAndLabels(Dataset):
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
-
             labels = self.labels[index].copy()
             if labels.size:  # normalized xywh to pixel xyxy format
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
@@ -617,7 +647,7 @@ class LoadImagesAndLabels(Dataset):
 
         nl = len(labels)  # number of labels
         if nl:
-            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
+            labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=960, h=608, clip=True, eps=1E-3)
 
         if self.augment:
             # Albumentations
@@ -670,6 +700,18 @@ class LoadImagesAndLabels(Dataset):
             return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
         else:
             return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
+    def load_roi_image(self, i):
+        roi_im, f, fn = self.roi_ims[i], self.im_files[i], self.roi_npy_files[i]
+        if roi_im is None:
+            if fn.exists():
+                im = np.load(fn)
+            else:
+                im = cv2.imread(f)
+                assert im is not None, f'Image Not Found {f}'
+            roi_im = im[180:788, 400:1360, :]
+            return roi_im
+        else:
+            return self.roi_im[i]
 
     def cache_images_to_disk(self, i):
         # Saves an image as an *.npy file for faster loading

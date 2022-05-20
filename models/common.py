@@ -237,6 +237,38 @@ class GhostBottleneck(nn.Module):
     def forward(self, x):
         return self.conv(x) + self.shortcut(x)
 
+class Seperate_fm(nn.Module):
+    def __init__(self, out_id=0):
+        super().__init__()
+        self.out_id = out_id
+
+    def forward(self, x):
+        device = x.device
+        b, c, h, w = x.shape
+        half_h = int(h/2) 
+        glbx = x[:, :, :half_h, :]
+        locx = x[:, :, half_h:, :]
+        tmp = torch.zeros((b, c, h, 2*w), device=device)
+        start_index_w = int(w*400/1920)
+        start_index_h = int(h*180/1200.)
+        tmp[:, :, start_index_h:start_index_h+half_h, start_index_w:start_index_w+w] = locx
+        if self.out_id == 0:
+            return glbx
+        else:
+            return tmp
+
+class Get_roi_4(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        _, _, h, w = x.shape
+        #half_h = int(h/2)
+        #half_w = int(w/2)
+        #start_index_w = int(w*400/1920.)
+        #start_index_h = int(h*180/1200.)
+        #out = x[:, :, start_index_h:start_index_h+half_h, start_index_w:start_index_w+half_w]
+        return x
 
 class Contract(nn.Module):
     # Contract width-height into channels, i.e. x(1,64,80,80) to x(1,256,40,40)
@@ -302,7 +334,6 @@ class DetectMultiBackend(nn.Module):
         if data:  # data.yaml path (optional)
             with open(data, errors='ignore') as f:
                 names = yaml.safe_load(f)['names']  # class names
-
         if pt:  # PyTorch
             model = attempt_load(weights if isinstance(weights, list) else w, map_location=device)
             stride = max(int(model.stride.max()), 32)  # model stride
